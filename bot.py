@@ -45,8 +45,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = main_model.generate_content(user_message)
         await update.message.reply_text(response.text[:4096])
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await update.message.reply_text("❌ Ошибка при обработке")
+        error_text = str(e)
+        logger.error(f"Error: {error_text}")
+        print(f"DEBUG: {error_text}")
+        await update.message.reply_text(f"❌ Ошибка: {error_text[:200]}")
 
 async def generate_daily_report(context: ContextTypes.DEFAULT_TYPE):
     global daily_conversations
@@ -62,11 +64,11 @@ async def generate_daily_report(context: ContextTypes.DEFAULT_TYPE):
     
     try:
         report = report_model.generate_content(
-            f"Проанализируй диалоги и дай краткий отчёт:\n{conversations_text}"
+            f"Проанализируй диалоги и дай краткий отчёт о чем общались:\n{conversations_text}"
         )
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID, 
-            text=f"📊 Отчёт\n\n{report.text[:4096]}"
+            text=f"📊 Отчёт за день\n\n{report.text[:4096]}"
         )
         logger.info("Daily report sent")
     except Exception as e:
@@ -75,11 +77,37 @@ async def generate_daily_report(context: ContextTypes.DEFAULT_TYPE):
     daily_conversations = []
 
 async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await generate_daily_report(context)
-    await update.message.reply_text("✅ Отчёт отправлен!")
+    """Команда /ok - отправить отчёт прямо сейчас"""
+    global daily_conversations
+    
+    if not daily_conversations:
+        await update.message.reply_text("📭 Нет диалогов для отчёта")
+        return
+    
+    conversations_text = "\n".join([
+        f"[{c['time']}] {c['user']}: {c['message']}" 
+        for c in daily_conversations
+    ])
+    
+    try:
+        report = report_model.generate_content(
+            f"Проанализируй диалоги и дай краткий отчёт о чем общались:\n{conversations_text}"
+        )
+        await update.message.reply_text(f"📊 Отчёт\n\n{report.text[:4096]}")
+        logger.info("Manual report sent via /ok")
+    except Exception as e:
+        error_text = str(e)
+        logger.error(f"Report error: {error_text}")
+        await update.message.reply_text(f"❌ Ошибка отчёта: {error_text[:200]}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот с Gemini 🤖")
+    await update.message.reply_text(
+        "Привет! Я бот с Gemini 🤖\n\n"
+        "Команды:\n"
+        "/start - начать\n"
+        "/ok - получить отчёт о диалогах\n"
+        "/report - ежедневный отчёт (для админа)"
+    )
 
 # === FLASK ===
 def run_flask():
@@ -96,9 +124,11 @@ def main():
     application = Application.builder().token(token).build()
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("report", manual_report))
+    application.add_handler(CommandHandler("ok", manual_report))
+    application.add_handler(CommandHandler("report", manual_report))  # Два способа
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
+    # Job для ежедневного отчёта в 23:00
     application.job_queue.run_daily(generate_daily_report, time=time(hour=23, minute=0))
     
     logger.info("Starting polling...")

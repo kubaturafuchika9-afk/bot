@@ -24,8 +24,8 @@ def ping():
 
 # Gemini
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-main_model = genai.GenerativeModel('gemini-1.5-flash')
-report_model = genai.GenerativeModel('gemini-1.5-pro')
+main_model = genai.GenerativeModel('gemini-flash-latest')  # ✅ gemini-1.5-flash
+report_model = genai.GenerativeModel('gemini-pro-latest')  # ✅ для отчётов
 
 daily_conversations = []
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -88,12 +88,10 @@ def run_flask():
 
 # === MAIN ===
 def main():
-    # Запустить Flask в отдельном потоке
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask started in background thread")
     
-    # Настроить бота
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     application = Application.builder().token(token).build()
     
@@ -101,10 +99,8 @@ def main():
     application.add_handler(CommandHandler("report", manual_report))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Job для ежедневного отчёта
     application.job_queue.run_daily(generate_daily_report, time=time(hour=23, minute=0))
     
-    # Polling в основном потоке
     logger.info("Starting polling...")
     asyncio.run(application.run_polling(drop_pending_updates=True))
 

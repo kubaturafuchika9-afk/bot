@@ -24,8 +24,8 @@ def ping():
 
 # Gemini
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-main_model = genai.GenerativeModel('gemini-flash-latest')  # ✅ gemini-1.5-flash
-report_model = genai.GenerativeModel('gemini-pro-latest')  # ✅ для отчётов
+main_model = genai.GenerativeModel('gemini-flash-latest')
+report_model = genai.GenerativeModel('gemini-pro-latest')
 
 daily_conversations = []
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))

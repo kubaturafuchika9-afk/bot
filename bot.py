@@ -1,278 +1,433 @@
 import os
 import json
 import logging
-import datetime
-import threading
+from datetime import datetime, timedelta
+from collections import defaultdict
+from threading import Thread
 import time
-from collections import deque, Counter
+
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
+)
 import google.generativeai as genai
-from telegram.error import BadRequest
 
-# === CONFIGURATION ===
-PORT = int(os.environ.get("PORT", 10000))
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-DATA_DIR = "data"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PORT = int(os.getenv("PORT", 10000))
 
 # Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Ensure data directory exists
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Data directories
+DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# === FLASK KEEP-ALIVE SERVER ===
-app = Flask(__name__)
+# ============================================================================
+# FLASK APP (Keep-Alive)
+# ============================================================================
 
-@app.route('/')
-def home():
-    return "Bot is alive!", 200
+flask_app = Flask(__name__)
 
-@app.route('/ping')
+@flask_app.route("/")
+def index():
+    return "Бот живой!", 200
+
+@flask_app.route("/ping")
 def ping():
     return "pong", 200
 
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
-# === GEMINI SETUP ===
-genai.configure(api_key=GEMINI_KEY)
-# Using gemini-flash-latest as requested
-model = genai.GenerativeModel('gemini-1.5-flash-latest')
+def get_today_date():
+    """Get today's date in YYYY-MM-DD format"""
+    return datetime.now().strftime("%Y-%m-%d")
 
-# === STATE MANAGEMENT ===
-# Context: {user_id: deque([{'role': 'user'/'model', 'text': '...'}], maxlen=5)}
-user_contexts = {}
+def get_current_hour():
+    """Get current hour in HH format"""
+    return datetime.now().strftime("%H")
 
-def get_dialog_filename():
-    """Returns filename for today's JSON log."""
-    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(DATA_DIR, f"dialogs_{date_str}.json")
+def get_dialogs_file():
+    """Get path to today's dialogs file"""
+    return os.path.join(DATA_DIR, f"dialogs_{get_today_date()}.json")
 
-def log_message_to_json(user_id, user_name, text):
-    """Logs user message to JSON file without API calls."""
-    filename = get_dialog_filename()
-    entry = {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "user_id": str(user_id),
+def get_user_context_file():
+    """Get path to user context file"""
+    return os.path.join(DATA_DIR, "user_context.json")
+
+def get_hourly_report_file(hour=None):
+    """Get path to hourly report file"""
+    if hour is None:
+        hour = get_current_hour()
+    return os.path.join(DATA_DIR, f"hourly_report_{hour}.txt")
+
+def get_daily_report_file():
+    """Get path to daily report file"""
+    return os.path.join(DATA_DIR, "daily_report.txt")
+
+def load_json(filepath):
+    """Load JSON from file, return empty list/dict if not exists"""
+    if not os.path.exists(filepath):
+        return [] if filepath.endswith("dialogs") else {}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return [] if filepath.endswith("dialogs") else {}
+
+def save_json(filepath, data):
+    """Save JSON to file"""
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving JSON to {filepath}: {e}")
+
+def log_dialog(user_id, user_name, message_text):
+    """Log user message to dialogs file"""
+    dialogs_file = get_dialogs_file()
+    dialogs = load_json(dialogs_file)
+    
+    new_entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user_id": user_id,
         "user_name": user_name,
-        "message": text
+        "message": message_text
     }
     
-    data = []
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except json.JSONDecodeError:
-            data = []
-    
-    data.append(entry)
-    
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    dialogs.append(new_entry)
+    save_json(dialogs_file, dialogs)
 
-def generate_local_report(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Generates reports locally based on JSON logs.
-    Running this WITHOUT API calls to save tokens.
-    """
-    now = datetime.datetime.now()
-    filename = get_dialog_filename()
+def get_user_context(user_id):
+    """Get user's message context (last 5 messages)"""
+    context_file = get_user_context_file()
+    contexts = load_json(context_file)
+    return contexts.get(str(user_id), [])
+
+def save_user_context(user_id, messages):
+    """Save user's message context"""
+    context_file = get_user_context_file()
+    contexts = load_json(context_file)
     
-    if not os.path.exists(filename):
-        logger.info("No data for report yet.")
+    # Keep only last 5 messages
+    contexts[str(user_id)] = messages[-5:]
+    save_json(context_file, contexts)
+
+def clear_user_context(user_id):
+    """Clear user's context"""
+    context_file = get_user_context_file()
+    contexts = load_json(context_file)
+    
+    if str(user_id) in contexts:
+        del contexts[str(user_id)]
+    save_json(context_file, contexts)
+
+def generate_hourly_report():
+    """Generate hourly report from dialogs (LOCAL - no API calls)"""
+    dialogs_file = get_dialogs_file()
+    dialogs = load_json(dialogs_file)
+    
+    if not dialogs:
         return
-
+    
+    # Get current hour
+    current_hour = get_current_hour()
+    hour_start = f"{current_hour}:"
+    
+    # Filter messages from this hour
+    hour_messages = [
+        d for d in dialogs
+        if d["timestamp"].startswith(f"{get_today_date()} {current_hour}:")
+    ]
+    
+    if not hour_messages:
+        return
+    
+    # Calculate stats
+    unique_users = len(set(d["user_id"] for d in hour_messages))
+    total_messages = len(hour_messages)
+    
+    # Extract topics (simple keyword counting)
+    all_text = " ".join([d["message"].lower() for d in hour_messages])
+    
+    # Get interesting questions (messages with "?")
+    questions = [d["message"] for d in hour_messages if "?" in d["message"]][:5]
+    
+    # Generate report
+    report = f"""ОТЧЁТ ЗА ЧАС {current_hour}:00-{current_hour}:59
+════════════════════════
+Всего сообщений: {total_messages}
+Пользователей: {unique_users}
+Интересные вопросы:
+"""
+    
+    if questions:
+        for q in questions:
+            report += f"- {q[:100]}\n"
+    else:
+        report += "- Нет вопросов\n"
+    
+    # Save report
+    report_file = get_hourly_report_file(current_hour)
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            logs = json.load(f)
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(report)
+        logger.info(f"Hourly report saved: {report_file}")
     except Exception as e:
-        logger.error(f"Error reading logs for report: {e}")
+        logger.error(f"Error saving hourly report: {e}")
+
+def generate_daily_report():
+    """Generate daily report from dialogs (LOCAL - no API calls)"""
+    dialogs_file = get_dialogs_file()
+    dialogs = load_json(dialogs_file)
+    
+    if not dialogs:
         return
-
-    # Filter logs for the last hour
-    current_hour_start = now.replace(minute=0, second=0, microsecond=0)
-    last_hour_start = current_hour_start - datetime.timedelta(hours=1)
     
-    hourly_logs = []
-    for log in logs:
-        try:
-            log_time = datetime.datetime.strptime(log['timestamp'], "%Y-%m-%d %H:%M:%S")
-            if last_hour_start <= log_time < current_hour_start:
-                hourly_logs.append(log)
-        except ValueError:
-            continue
-
-    if not hourly_logs:
-        return # Nothing to report for this hour
-
-    # Basic Analytics (No AI)
-    msg_count = len(hourly_logs)
-    users = set(l['user_id'] for l in hourly_logs)
+    # Calculate daily stats
+    unique_users = len(set(d["user_id"] for d in dialogs))
+    total_messages = len(dialogs)
     
-    # Simple keyword extraction (proxy for "themes")
-    all_words = " ".join([l['message'] for l in hourly_logs]).lower().split()
-    # Filter short words to remove prepositions roughly
-    words = [w for w in all_words if len(w) > 4] 
-    common_themes = Counter(words).most_common(3)
-    themes_str = ", ".join([t[0] for t in common_themes])
+    # Count messages per user
+    user_counts = defaultdict(int)
+    for d in dialogs:
+        user_counts[d["user_name"]] += 1
     
-    # "Interesting" questions = simply longest messages (heuristic)
-    sorted_by_len = sorted(hourly_logs, key=lambda x: len(x['message']), reverse=True)
-    top_questions = sorted_by_len[:2]
+    top_users = sorted(user_counts.items(), key=lambda x: x[1], reverse=True)[:5]
     
-    report_content = (
-        f"ОТЧЁТ ЗА ЧАС {last_hour_start.strftime('%H:%M')}-{current_hour_start.strftime('%H:%M')}\n"
-        f"════════════════════════\n"
-        f"Всего сообщений: {msg_count}\n"
-        f"Пользователей: {len(users)}\n"
-        f"Основные слова (темы): {themes_str}\n"
-        f"Интересные вопросы (длинные):\n"
-    )
+    # Get interesting questions
+    questions = [d["message"] for d in dialogs if "?" in d["message"]][:10]
     
-    for q in top_questions:
-        report_content += f"- {q['message'][:50]}...\n"
+    # Generate report
+    report = f"""ЕЖЕДНЕВНЫЙ ОТЧЁТ {get_today_date()}
+════════════════════════════════
+Всего сообщений: {total_messages}
+Всего пользователей: {unique_users}
 
-    # Save Hourly Report
-    report_filename = os.path.join(DATA_DIR, f"hourly_report_{last_hour_start.strftime('%H')}.txt")
-    with open(report_filename, "w", encoding="utf-8") as f:
-        f.write(report_content)
-        
-    # Daily Report (Triggered at 23:00)
-    if now.hour == 23 and now.minute < 59: # Check logic handled by JobQueue timing ideally
-        daily_filename = os.path.join(DATA_DIR, "daily_report.txt")
-        # Simple daily summary overwriting the hourly structure logic for brevity
-        daily_content = f"ИТОГОВЫЙ ОТЧЁТ ЗА {now.strftime('%Y-%m-%d')}\nTotal logs: {len(logs)}"
-        with open(daily_filename, "w", encoding="utf-8") as f:
-            f.write(daily_content)
+Топ пользователей:
+"""
+    
+    for name, count in top_users:
+        report += f"- {name}: {count} сообщений\n"
+    
+    report += f"""
+Интересные вопросы:
+"""
+    
+    if questions:
+        for q in questions:
+            report += f"- {q[:100]}\n"
+    else:
+        report += "- Нет вопросов\n"
+    
+    # Save report
+    report_file = get_daily_report_file()
+    try:
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(report)
+        logger.info(f"Daily report saved: {report_file}")
+    except Exception as e:
+        logger.error(f"Error saving daily report: {e}")
 
-# === BOT COMMANDS ===
+# ============================================================================
+# TELEGRAM BOT HANDLERS
+# ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # Initialize context
-    user_contexts[user_id] = deque(maxlen=5)
-    await update.message.reply_text("Привет! Я бот на базе Gemini Flash. Говорим коротко и по делу. /clear чтобы забыть всё.")
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in user_contexts:
-        user_contexts[user_id].clear()
-    await update.message.reply_text("🧹 Память очищена.")
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user stats based on local file parsing."""
-    user_id = str(update.effective_user.id)
-    filename = get_dialog_filename()
-    count = 0
-    last_time = "Никогда"
-    
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                user_msgs = [d for d in data if d['user_id'] == user_id]
-                count = len(user_msgs)
-                if user_msgs:
-                    last_time = user_msgs[-1]['timestamp']
-        except:
-            pass
-            
-    await update.message.reply_text(f"📊 Твоя статистика за сегодня:\nСообщений: {count}\nПоследний раз: {last_time}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name
-    text = update.message.text
-
-    if not text:
-        return
-
-    # 1. Log to JSON (Local Requirement)
-    log_message_to_json(user_id, user_name, text)
-
-    # 2. Manage Context
-    if user_id not in user_contexts:
-        user_contexts[user_id] = deque(maxlen=5)
-    
-    # 3. Construct Prompt (System Instruction + Context + Current)
-    # Instruction is injected here to save tokens on init and keep control
-    system_instruction = (
-        "ROLE: You are a helpful Telegram bot.\n"
-        "MODEL: gemini-flash-latest\n"
-        "LANGUAGES: Russian, Azerbaijani, English.\n"
-        "STYLE: Short (max 300 chars), concise, helpful. Can use profanity ONLY if user swears first, but NO insults.\n"
-        "FORMAT: Use Markdown for tables/bold.\n"
-        "GOAL: Answer the user's last message based on history."
+    """Handle /start command"""
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Привет, {user.first_name}! 👋\n\n"
+        "Я ИИ-помощник на базе Gemini. Могу:\n"
+        "• Отвечать на вопросы\n"
+        "• Помогать с кодом\n"
+        "• Просто общаться\n\n"
+        "Команды:\n"
+        "/clear - очистить историю\n"
+        "/stats - твоя статистика"
     )
 
-    history_str = ""
-    for msg in user_contexts[user_id]:
-        role_label = "User" if msg['role'] == 'user' else "Bot"
-        history_str += f"{role_label}: {msg['text']}\n"
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clear command"""
+    user_id = update.effective_user.id
+    clear_user_context(user_id)
+    await update.message.reply_text("✅ История очищена!")
 
-    full_prompt = f"{system_instruction}\n\nHISTORY:\n{history_str}\n\nUser (Current): {text}\nBot:"
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command"""
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    dialogs_file = get_dialogs_file()
+    dialogs = load_json(dialogs_file)
+    
+    user_messages = [d for d in dialogs if d["user_id"] == user_id]
+    message_count = len(user_messages)
+    
+    last_message = "нет сообщений"
+    if user_messages:
+        last_message = user_messages[-1]["timestamp"]
+    
+    await update.message.reply_text(
+        f"📊 Статистика {user_name}:\n"
+        f"Всего сообщений: {message_count}\n"
+        f"Последнее: {last_message}"
+    )
 
-    # 4. Call Gemini API
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user messages and reply with Gemini"""
+    user = update.effective_user
+    user_id = user.id
+    user_name = user.first_name or "Unknown"
+    message_text = update.message.text
+    
+    # Log dialog
+    log_dialog(user_id, user_name, message_text)
+    
+    # Get user context
+    user_messages = get_user_context(user_id)
+    
+    # Add current message to context
+    user_messages.append({
+        "role": "user",
+        "content": message_text
+    })
+    
+    # Build system prompt
+    system_prompt = (
+        "You are a helpful Russian-speaking AI assistant named Artemiy. "
+        "Respond concisely (max 300-500 characters). "
+        "You can respond in Russian, Azerbaijani, or English based on user's language. "
+        "Be friendly and helpful. "
+        "You can use mild swearing in response to swearing, but never insult. "
+        "Support Markdown formatting for tables."
+    )
+    
     try:
-        response = model.generate_content(full_prompt)
-        reply_text = response.text.strip()
+        # Call Gemini API
+        model = genai.GenerativeModel("gemini-flash-latest")
         
-        # Save interaction to RAM context
-        user_contexts[user_id].append({'role': 'user', 'text': text})
-        user_contexts[user_id].append({'role': 'model', 'text': reply_text})
-
-        # Send to Telegram
-        await update.message.reply_markdown(reply_text)
-
+        # Build messages for API
+        api_messages = [
+            {"role": "user", "parts": [system_prompt]},
+        ]
+        
+        for msg in user_messages:
+            api_messages.append({
+                "role": msg["role"],
+                "parts": [msg["content"]]
+            })
+        
+        # Generate response
+        response = model.generate_content(
+            contents=api_messages,
+            generation_config={"max_output_tokens": 300}
+        )
+        
+        bot_reply = response.text.strip()
+        
+        # Add bot response to context
+        user_messages.append({
+            "role": "model",
+            "content": bot_reply
+        })
+        
+        # Save updated context
+        save_user_context(user_id, user_messages)
+        
+        # Send reply
+        await update.message.reply_text(bot_reply)
+        
+        # Check if hourly report should be generated
+        # (generate every hour at minute 0)
+        if datetime.now().minute == 0:
+            generate_hourly_report()
+        
+        # Check if daily report should be generated (at 23:00)
+        if datetime.now().hour == 23 and datetime.now().minute == 0:
+            generate_daily_report()
+        
     except Exception as e:
-        error_str = str(e)
-        logger.error(f"Gemini API Error: {error_str}")
+        error_msg = str(e)
         
-        if "429" in error_str:
+        if "429" in error_msg or "quota" in error_msg.lower():
             await update.message.reply_text("💰 Лимит на сегодня. Завтра попробуй!")
         else:
-            await update.message.reply_text("❌ Ошибка. Попробуй позже.")
+            await update.message.reply_text("❌ Ошибка. Попробуй позже")
+        
+        logger.error(f"Error processing message from {user_id}: {e}")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+# ============================================================================
+# BACKGROUND TASKS
+# ============================================================================
 
-# === MAIN ENTRY POINT ===
+def run_flask():
+    """Run Flask app in background thread"""
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False)
+
+def periodic_reports():
+    """Check for reports every minute"""
+    while True:
+        try:
+            now = datetime.now()
+            
+            # Generate hourly report at minute 0 of every hour
+            if now.minute == 0:
+                generate_hourly_report()
+                time.sleep(60)  # Sleep 60 seconds to avoid duplicate
+            
+            # Generate daily report at 23:00
+            if now.hour == 23 and now.minute == 0:
+                generate_daily_report()
+                time.sleep(60)
+            
+            time.sleep(30)  # Check every 30 seconds
+        except Exception as e:
+            logger.error(f"Error in periodic_reports: {e}")
+            time.sleep(60)
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    # 1. Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    """Start the bot"""
+    
+    # Start Flask in background
+    flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    logger.info(f"Flask app started on port {PORT}")
+    
+    # Start periodic reports thread
+    reports_thread = Thread(target=periodic_reports, daemon=True)
+    reports_thread.start()
+    logger.info("Periodic reports thread started")
+    
+    # Create application
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start polling
+    logger.info("Bot started. Polling for messages...")
+    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
 
-    # 2. Setup Telegram Bot
-    if not TOKEN:
-        logger.error("No TELEGRAM_BOT_TOKEN found!")
-        return
-
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_error_handler(error_handler)
-
-    # Job Queue for Reports (Every hour)
-    job_queue = application.job_queue
-    # Run report generation every hour at minute 0
-    job_queue.run_repeating(generate_local_report, interval=3600, first=10) 
-
-    logger.info("Bot started via Polling...")
-    application.run_polling()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
